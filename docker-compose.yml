@@ -1,0 +1,160 @@
+version: '3.8'
+
+services:
+  # PostgreSQL with pgvector extension
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ragent-postgres
+    environment:
+      POSTGRES_USER: ragent
+      POSTGRES_PASSWORD: ragent
+      POSTGRES_DB: ragent
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ragent -d ragent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ragent-network
+
+  # Milvus vector database (standalone mode for development)
+  milvus:
+    image: milvusdb/milvus:v2.4.0
+    container_name: ragent-milvus
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_USE_EMBED: "true"
+      ETCD_DATA_DIR: /var/lib/milvus/etcd
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET_NAME: milvus
+      MINIO_USE_SSL: "false"
+      COMMON_STORAGETYPE: local
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    depends_on:
+      - minio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - ragent-network
+
+  # MinIO object storage
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    container_name: ragent-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+    networks:
+      - ragent-network
+
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/mc:RELEASE.2024-01-16T16-07-38Z
+    container_name: ragent-minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc config host add minio http://minio:9000 minioadmin minioadmin) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb minio/ragent --ignore-existing;
+      /usr/bin/mc mb minio/milvus --ignore-existing;
+      /usr/bin/mc anonymous set public minio/ragent;
+      exit 0;
+      "
+    networks:
+      - ragent-network
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ragent-backend
+    environment:
+      RAGENT_DB_HOST: postgres
+      RAGENT_DB_PORT: 5432
+      RAGENT_DB_USER: ragent
+      RAGENT_DB_PASSWORD: ragent
+      RAGENT_DB_NAME: ragent
+      RAGENT_VECTOR_MILVUS_ENABLED: "true"
+      RAGENT_VECTOR_MILVUS_HOST: milvus
+      RAGENT_VECTOR_MILVUS_PORT: 19530
+      RAGENT_STORAGE_ENDPOINT: minio:9000
+      RAGENT_STORAGE_ACCESS_KEY: minioadmin
+      RAGENT_STORAGE_SECRET_KEY: minioadmin
+      RAGENT_STORAGE_BUCKET: ragent
+      RAGENT_STORAGE_SECURE: "false"
+      RAGENT_API_HOST: 0.0.0.0
+      RAGENT_API_PORT: 8000
+      RAGENT_ENVIRONMENT: development
+      RAGENT_DEBUG: "true"
+      RAGENT_LLM_PROVIDER: mock
+      RAGENT_LLM_MODEL: mock-gpt-4
+      RAGENT_EMBEDDING_PROVIDER: mock
+      RAGENT_EMBEDDING_MODEL: mock-embedding
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./skills:/app/skills
+    depends_on:
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - ragent-network
+
+  # Frontend development server
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ragent-frontend
+    environment:
+      VITE_API_URL: http://localhost:8000/v1
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - ragent-network
+
+volumes:
+  postgres_data:
+  milvus_data:
+  minio_data:
+
+networks:
+  ragent-network:
+    driver: bridge
